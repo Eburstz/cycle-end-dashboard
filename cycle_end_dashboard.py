@@ -218,4 +218,4 @@ pf = pd.DataFrame(rows2, columns=["Coin (CoinGecko id)","Price (USD)","Target ra
 st.subheader("Your Coins – live price vs target range")
 st.dataframe(pf, use_container_width=True)
 
-st.caption("🟢 healthy · 🟡 heating up · 🔴 high top risk · ⚪ data unavailable")
+st.caption
