@@ -1,4 +1,4 @@
-# cycle_end_dashboard.py — Stable CoinGecko version (only Funding = N/A)
+# cycle_end_dashboard.py — Stable w/ retry + cached fallbacks (no keys)
 import time, requests, datetime as dt
 import pandas as pd
 import streamlit as st
@@ -6,48 +6,93 @@ import streamlit as st
 st.set_page_config(page_title="Cycle-End Dashboard", layout="wide")
 HALVING_DATE = dt.date(2024, 4, 19)
 
-# ---------- HTTP helper (retry + UA) ----------
-def get_json(url, params=None, tries=3, sleep=1.2, timeout=25):
+# ---------------- Helper: robust GET w/ exponential backoff ----------------
+def get_json(url, params=None, timeout=25, tries=5, base_sleep=0.8):
     headers = {"User-Agent": "Mozilla/5.0 (Cycle-End-Dashboard)"}
-    for _ in range(tries):
+    last_err = None
+    for i in range(tries):
         try:
             r = requests.get(url, params=params, timeout=timeout, headers=headers)
             if r.status_code == 200:
                 return r.json()
-        except Exception:
-            pass
-        time.sleep(sleep)
+            last_err = f"{r.status_code} {r.text[:120]}"
+            # If rate-limited or server busy, wait longer each try
+            time.sleep(base_sleep * (2 ** i))
+        except Exception as e:
+            last_err = str(e)
+            time.sleep(base_sleep * (2 ** i))
+    # Surface error in diagnostics area
+    st.session_state.setdefault("diag_errors", []).append(f"{url} -> {last_err}")
     return None
 
-# ---------- CoinGecko + Fear & Greed (free) ----------
+# ---------------- Cached fallbacks (persist last good data) ----------------
+def _save_backup(key, value):
+    st.session_state[f"backup_{key}"] = value
+
+def _get_backup(key, default):
+    return st.session_state.get(f"backup_{key}", default)
+
+# Use cache for fresh data; if fail -> return last backup
+@st.cache_data(ttl=300)
+def _cg_prices(ids):
+    return get_json("https://api.coingecko.com/api/v3/simple/price",
+                    params={"ids": ",".join(ids), "vs_currencies": "usd"}) or {}
+
 def cg_prices(ids):
-    js = get_json(
-        "https://api.coingecko.com/api/v3/simple/price",
-        params={"ids": ",".join(ids), "vs_currencies": "usd"},
-    )
-    if not js: return {}
-    return {k: v.get("usd") for k, v in js.items()}
+    js = _cg_prices(ids)
+    if js:
+        _save_backup("prices", js)
+    else:
+        js = _get_backup("prices", {})
+    return {k: v.get("usd") for k, v in (js or {}).items()}
+
+@st.cache_data(ttl=300)
+def _cg_markets(ids):
+    return get_json("https://api.coingecko.com/api/v3/coins/markets",
+                    params={"vs_currency":"usd","ids":",".join(ids),
+                            "price_change_percentage":"7d","per_page":len(ids),"page":1}) or []
 
 def cg_markets(ids):
-    js = get_json(
-        "https://api.coingecko.com/api/v3/coins/markets",
-        params={
-            "vs_currency": "usd",
-            "ids": ",".join(ids),
-            "price_change_percentage": "7d",
-            "per_page": len(ids),
-            "page": 1,
-        },
-    )
+    js = _cg_markets(ids)
+    if js:
+        _save_backup("markets", js)
+    else:
+        js = _get_backup("markets", [])
     return js or []
 
+@st.cache_data(ttl=300)
+def _cg_global():
+    return get_json("https://api.coingecko.com/api/v3/global") or {}
+
 def cg_global():
-    js = get_json("https://api.coingecko.com/api/v3/global")
+    js = _cg_global()
+    if js:
+        _save_backup("global", js)
+    else:
+        js = _get_backup("global", {})
     try:
         return float(js["data"]["market_cap_percentage"]["btc"])
     except Exception:
         return None
 
+@st.cache_data(ttl=300)
+def _btc_history_30d():
+    return get_json("https://api.coingecko.com/api/v3/coins/bitcoin/market_chart",
+                    params={"vs_currency":"usd","days":30})
+
+def btc_history_30d():
+    js = _btc_history_30d()
+    if js and "prices" in js:
+        _save_backup("btc30", js)
+    else:
+        js = _get_backup("btc30", None)
+    if not js or "prices" not in js:
+        return pd.DataFrame()
+    df = pd.DataFrame(js["prices"], columns=["ts","price"])
+    df["date"] = pd.to_datetime(df["ts"], unit="ms").dt.date
+    return df[["date","price"]]
+
+@st.cache_data(ttl=300)
 def fear_greed():
     js = get_json("https://api.alternative.me/fng/?limit=1&format=json")
     if js and js.get("data"):
@@ -55,18 +100,16 @@ def fear_greed():
         return int(x["value"]), x["value_classification"]
     return None, None
 
-def btc_history_30d():
-    js = get_json(
-        "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart",
-        params={"vs_currency": "usd", "days": 30},
-    )
-    if not js: return pd.DataFrame()
-    df = pd.DataFrame(js["prices"], columns=["ts", "price"])
-    df["date"] = pd.to_datetime(df["ts"], unit="ms").dt.date
-    return df[["date","price"]]
-
-# ---------- UI ----------
+# ---------------- UI header ----------------
 st.title("📊 Crypto Cycle-End Dashboard (Live • Free APIs Only)")
+
+# Quick controls
+cols = st.columns(2)
+with cols[0]:
+    if st.button("🔄 Refresh data (clear cache)"):
+        st.cache_data.clear()
+        st.session_state.pop("diag_errors", None)
+        st.experimental_rerun()
 
 day_count = (dt.date.today() - HALVING_DATE).days
 
@@ -86,7 +129,7 @@ c3.metric("SOL", f"${sol:,.0f}")
 c4.metric("Days after halving", str(day_count))
 st.write("---")
 
-# ---------- Signals (Funding intentionally N/A) ----------
+# ---------------- Signals (Funding intentionally N/A) ----------------
 rows = []
 
 # 1) Price Action (BTC 30d)
@@ -99,29 +142,31 @@ else:
     elif chg < 0.05: rows.append(["Price Action","🟡", f"Flat {chg:.0%} in 30d"])
     else: rows.append(["Price Action","🟢", f"Up {chg:.0%} in 30d"])
 
-# 2) Funding Rates (not wired on purpose)
+# 2) Funding Rates (left N/A by design)
 rows.append(["Funding Rates","⚪","N/A"])
 
-# 3) Spot vs Perps (proxy since funding unknown → assume healthy)
+# 3) Spot vs Perps (proxy)
 rows.append(["Spot vs Perps","🟢","Spot healthy"])
 
-# 4) Sentiment (Fear & Greed)
+# 4) Sentiment (F&G)
 fg, fg_label = fear_greed()
-if fg is None: rows.append(["Sentiment (F&G)","⚪","N/A"])
+if fg is None:
+    rows.append(["Sentiment (F&G)","⚪","N/A"])
 else:
     if fg >= 90: rows.append(["Sentiment (F&G)","🔴", f"{fg} (Extreme Greed)"])
     elif fg >= 75: rows.append(["Sentiment (F&G)","🟡", f"{fg} (Greed)"])
     else: rows.append(["Sentiment (F&G)","🟢", f"{fg} ({fg_label})"])
 
-# 5) Rotation (BTC Dominance)
+# 5) Rotation (BTC.D)
 dom = cg_global()
-if dom is None: rows.append(["Rotation (BTC.D)","⚪","N/A"])
+if dom is None:
+    rows.append(["Rotation (BTC.D)","⚪","N/A"])
 else:
     if dom < 50: rows.append(["Rotation (BTC.D)","🟡", f"BTC.D {dom:.1f}% (alt rotation forming)"])
     else: rows.append(["Rotation (BTC.D)","🟢", f"BTC.D {dom:.1f}%"])
 
-# 6) Alt Breadth (≥30% in 7d) using markets for your alts (excl. BTC)
-mkts = cg_markets(ids[1:])
+# 6) Alt Breadth (≥30% in 7d)
+mkts = cg_markets(ids[1:])  # exclude BTC
 up_30, valid = 0, 0
 for c in mkts:
     p7 = c.get("price_change_percentage_7d_in_currency")
@@ -136,7 +181,7 @@ if valid:
 else:
     rows.append(["Alt Breadth (≥30% in 7d)","⚪","N/A"])
 
-# 7) Volume Thrust (24h Vol / MCap)
+# 7) Volume Thrust (Vol/MCap)
 high_turn, valid2 = 0, 0
 for c in mkts:
     mc = c.get("market_cap") or 0
@@ -156,7 +201,7 @@ else:
 st.subheader("Cycle-End Signals")
 st.dataframe(pd.DataFrame(rows, columns=["Signal","Status","Details"]), use_container_width=True)
 
-# ---------- Your coins vs targets ----------
+# ---------------- Your coins vs target range ----------------
 targets = {
     "bitcoin":      (180_000, 220_000),
     "ethereum":     (12_500, 14_600),
@@ -184,4 +229,12 @@ st.dataframe(pd.DataFrame(rows2,
              columns=["Coin (CoinGecko id)","Price (USD)","Target range","Upside to range"]),
              use_container_width=True)
 
-st.caption("Only free endpoints used. If any value shows N/A or $0, refresh once — CoinGecko rate limits occasionally for ~60s.")
+# ---------------- Diagnostics ----------------
+with st.expander("Diagnostics"):
+    errs = st.session_state.get("diag_errors", [])
+    if errs:
+        st.write("Recent fetch errors (last run):")
+        for e in errs[-6:]:
+            st.write("•", e)
+    else:
+        st.write("No fetch errors recorded this run.")
