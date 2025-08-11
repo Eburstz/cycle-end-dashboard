@@ -257,4 +257,4 @@ with st.expander("Diagnostics (why something might be N/A)"):
     else:
         for k, v in diag.items():
             st.write(f"**{k}** → {v}")
-st.caption("Tip: If a row shows N/A, open Diagnostics to see which endpoint failed. No API keys required.")
+st.caption("Tip: If a row shows
