@@ -1,4 +1,4 @@
-# cycle_end_dashboard.py — Stable (5-min cache) + Funding Rates (Binance + Bybit)
+# cycle_end_dashboard.py — Stable (5-min cache) + Funding (Binance→Bybit→OKX) + Diagnostics
 import time, requests, datetime as dt
 import pandas as pd
 import streamlit as st
@@ -6,8 +6,8 @@ import streamlit as st
 st.set_page_config(page_title="Cycle-End Dashboard", layout="wide")
 HALVING_DATE = dt.date(2024, 4, 19)
 
-# ---------- Robust GET with exponential backoff ----------
-def _get_json(url, params=None, timeout=25, tries=5, base_sleep=0.8):
+# ---------------- Robust GET with exponential backoff ----------------
+def _get_json(url, params=None, timeout=25, tries=5, base_sleep=0.8, tag=None):
     headers = {"User-Agent": "Mozilla/5.0 (Cycle-End-Dashboard)"}
     last_err = None
     for i in range(tries):
@@ -19,15 +19,17 @@ def _get_json(url, params=None, timeout=25, tries=5, base_sleep=0.8):
         except Exception as e:
             last_err = str(e)
         time.sleep(base_sleep * (2 ** i))
-    st.session_state.setdefault("diag_errors", []).append(f"{url} -> {last_err}")
+    if tag:
+        st.session_state.setdefault("diag_errors", []).append(f"{tag}: {url} -> {last_err}")
     return None
 
-# ---------- CoinGecko + Fear & Greed (all cached 5 min) ----------
+# ---------------- CoinGecko + F&G (all cached 5 min) ----------------
 @st.cache_data(ttl=300)
 def cg_prices(ids):
     js = _get_json(
         "https://api.coingecko.com/api/v3/simple/price",
         params={"ids": ",".join(ids), "vs_currencies": "usd"},
+        tag="cg_prices",
     ) or {}
     return {k: v.get("usd") for k, v in js.items()}
 
@@ -42,11 +44,12 @@ def cg_markets(ids):
             "per_page": len(ids),
             "page": 1,
         },
+        tag="cg_markets",
     ) or []
 
 @st.cache_data(ttl=300)
 def cg_global():
-    js = _get_json("https://api.coingecko.com/api/v3/global") or {}
+    js = _get_json("https://api.coingecko.com/api/v3/global", tag="cg_global") or {}
     try:
         return float(js["data"]["market_cap_percentage"]["btc"])
     except Exception:
@@ -57,6 +60,7 @@ def btc_history_30d():
     js = _get_json(
         "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart",
         params={"vs_currency": "usd", "days": 30},
+        tag="btc_history_30d",
     )
     if not js or "prices" not in js:
         return pd.DataFrame()
@@ -66,13 +70,13 @@ def btc_history_30d():
 
 @st.cache_data(ttl=300)
 def fear_greed():
-    js = _get_json("https://api.alternative.me/fng/?limit=1&format=json")
+    js = _get_json("https://api.alternative.me/fng/?limit=1&format=json", tag="fear_greed")
     if js and js.get("data"):
         x = js["data"][0]
         return int(x["value"]), x["value_classification"]
     return None, None
 
-# ---------- Funding Rates (no keys) ----------
+# ---------------- Funding helpers (no keys) ----------------
 @st.cache_data(ttl=300)
 def binance_funding(symbol="BTCUSDT", limit=1):
     try:
@@ -84,9 +88,11 @@ def binance_funding(symbol="BTCUSDT", limit=1):
         )
         if r.status_code == 200:
             js = r.json()
-            return float(js[-1]["fundingRate"]) * 100  # percent per 8h
-    except Exception:
-        pass
+            return float(js[-1]["fundingRate"]) * 100
+        else:
+            st.session_state.setdefault("fund_diag", []).append(f"Binance {symbol}: {r.status_code}")
+    except Exception as e:
+        st.session_state.setdefault("fund_diag", []).append(f"Binance {symbol} err: {e}")
     return None
 
 @st.cache_data(ttl=300)
@@ -101,19 +107,42 @@ def bybit_funding(symbol="BTCUSDT"):
         if r.status_code == 200:
             js = r.json()
             return float(js["result"]["list"][0]["fundingRate"]) * 100
-    except Exception:
-        pass
+        else:
+            st.session_state.setdefault("fund_diag", []).append(f"Bybit {symbol}: {r.status_code}")
+    except Exception as e:
+        st.session_state.setdefault("fund_diag", []).append(f"Bybit {symbol} err: {e}")
     return None
 
-# ---------- UI header ----------
-st.title("📊 Crypto Cycle-End Dashboard (5-min cache • Free APIs)")
+@st.cache_data(ttl=300)
+def okx_funding(inst_id="BTC-USDT-SWAP"):
+    try:
+        r = requests.get(
+            "https://www.okx.com/api/v5/public/funding-rate",
+            params={"instId": inst_id},
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=20,
+        )
+        if r.status_code == 200:
+            js = r.json()
+            data = js.get("data", [])
+            if data:
+                return float(data[0]["fundingRate"]) * 100
+        else:
+            st.session_state.setdefault("fund_diag", []).append(f"OKX {inst_id}: {r.status_code}")
+    except Exception as e:
+        st.session_state.setdefault("fund_diag", []).append(f"OKX {inst_id} err: {e}")
+    return None
 
-# Manual refresh (clears cache, then re-runs)
-left, _ = st.columns([1,3])
+# ---------------- UI Header ----------------
+st.title("📊 Crypto Cycle-End Dashboard (5-min cache • Free APIs • Multi-source Funding)")
+
+# Manual refresh button
+left, _ = st.columns([1, 3])
 with left:
     if st.button("🔄 Refresh now (clear 5-min cache)"):
         st.cache_data.clear()
         st.session_state.pop("diag_errors", None)
+        st.session_state.pop("fund_diag", None)
         st.experimental_rerun()
 
 day_count = (dt.date.today() - HALVING_DATE).days
@@ -134,7 +163,7 @@ c3.metric("SOL", f"${sol:,.0f}")
 c4.metric("Days after halving", str(day_count))
 st.write("---")
 
-# ---------- Signals ----------
+# ---------------- Signals ----------------
 rows = []
 
 # 1) Price Action (BTC 30d)
@@ -147,14 +176,16 @@ else:
     elif chg < 0.05: rows.append(["Price Action","🟡", f"Flat {chg:.0%} in 30d"])
     else: rows.append(["Price Action","🟢", f"Up {chg:.0%} in 30d"])
 
-# 2) Funding Rates (Binance with Bybit fallback)
+# 2) Funding Rates (Binance → Bybit → OKX)
 f_btc = binance_funding("BTCUSDT")
 f_sol = binance_funding("SOLUSDT")
 if f_btc is None: f_btc = bybit_funding("BTCUSDT")
 if f_sol is None: f_sol = bybit_funding("SOLUSDT")
+if f_btc is None: f_btc = okx_funding("BTC-USDT-SWAP")
+if f_sol is None: f_sol = okx_funding("SOL-USDT-SWAP")
 
 if f_btc is None:
-    rows.append(["Funding Rates","⚪","N/A"])
+    rows.append(["Funding Rates", "⚪", "N/A"])
 else:
     if f_btc >= 0.10: status = "🔴"
     elif f_btc >= 0.05: status = "🟡"
@@ -224,7 +255,7 @@ else:
 st.subheader("Cycle-End Signals")
 st.dataframe(pd.DataFrame(rows, columns=["Signal","Status","Details"]), use_container_width=True)
 
-# ---------- Your coins vs target range ----------
+# ---------------- Your coins vs target range ----------------
 targets = {
     "bitcoin":      (180_000, 220_000),
     "ethereum":     (12_500, 14_600),
@@ -252,12 +283,17 @@ st.dataframe(pd.DataFrame(rows2,
              columns=["Coin (CoinGecko id)","Price (USD)","Target range","Upside to range"]),
              use_container_width=True)
 
-# ---------- Diagnostics ----------
+# ---------------- Diagnostics ----------------
 with st.expander("Diagnostics"):
     errs = st.session_state.get("diag_errors", [])
     if errs:
-        st.write("Recent fetch errors (last run):")
-        for e in errs[-6:]:
+        st.write("Recent fetch errors:")
+        for e in errs[-8:]:
             st.write("•", e)
     else:
-        st.write("No fetch errors recorded this run.")
+        st.write("No CoinGecko/F&G fetch errors recorded this run.")
+    fd = st.session_state.get("fund_diag", [])
+    if fd:
+        st.write("Funding diagnostics:")
+        for line in fd[-8:]:
+            st.write("•", line)
