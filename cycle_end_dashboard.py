@@ -273,10 +273,4 @@ for cid, price in cg_prices.items():
         lo, hi = targets[cid]
         pct_to_lo = (lo/price - 1)*100
         pct_to_hi = (hi/price - 1)*100
-        rows.append([cid, price, f"{lo} – {hi}", f"{pct_to_lo:.0f}% to {pct_to_hi:.0f}%"])
-
-coins_df = pd.DataFrame(rows, columns=["Coin (CoinGecko id)","Price (USD)","Target range","Upside to range"])
-st.subheader("Your Coins – live price vs target range")
-st.dataframe(coins_df, use_container_width=True)
-
-st.caption("🟢 healthy · 🟡 heating up · 🔴 high top risk · ⚪ requires API key")
+        rows.append([cid, price, f"{lo} – {hi}", f"{pct_to_lo:.0f}% to {pct_to_hi:.0f}
